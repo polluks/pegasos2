@@ -1,0 +1,565 @@
+BPlan Bootstrap's IKARUS Low-Level Monitor/Debugger
+===================================================
+
+INTRODUCTION
+============
+
+Over the years it was discovered that the Pegasos II firmware has a hidden
+IKARUS console. You can enter it during the early init stage (while the
+bootstrap is running) by pressing "ESC", which drops you into:
+
+Entering IKARUS low level console
+>?
+
+
+Through manual experimentation, a handful of commands were identified (there
+is no built-in help -- typing ? just prints "#RTFM"). A partial list was
+documented on the Pegasos II wiki page, but most commands remained unknown.
+
+
+By disassembling the bootstrap code in Ghidra, all the commands have now
+been fully reverse-engineered. Below is a complete reference table with
+descriptions and examples.
+
+The actual ROM (512KB) is mapped at 0xFFF00000 as per PowerPC specs,
+keep this in mind when playing with it.
+
+
+THE BASICS
+==========
+
+Most commands execute IMMEDIATELY on single keypress. No Enter key is
+needed for: b, s, l, r, +, -, g, x, q, c, m, V, v, space, ~, z.
+
+Only commands that accept hex number input wait for digits:
+a, w, i, o. These read hex digits one at a time and terminate on
+ANY non-hex character (Enter, Space, or any other key). So Enter
+is never required -- it just happens to be a convenient terminator.
+
+All letter commands are CASE-INSENSITIVE (both upper and lower work),
+EXCEPT for V/v which are intentionally different (see below).
+
+Typing '?' at the prompt prints "#RTFM" and returns to the prompt.
+Typing an invalid character prints '?' and returns to the prompt.
+
+
+========================================================================
+STATE VARIABLES
+========================================================================
+
+IKARUS keeps its state in GPRs (general purpose registers).
+These are the variables that commands read and modify:
+
+  A (address)   -- GPR r18. Memory address for r/w/+/-/g operations.
+                    Set by 'a'. Modified by +/-.
+
+  I (input)     -- GPR r16. Data register. Updated by 'r' (read from
+                    memory) or 'i' (set manually). Used by 'g' (r3=I).
+
+  O (output)    -- GPR r11. Write data register. Updated by 'o' (set
+                    manually). Used by 'w' (write to memory at A).
+
+  Mode (size)   -- GPR r17. Access size: 0=byte, 1=short, 2=long.
+                    Set by b/s/l commands. Affects r/w/+/- operations.
+
+  Verbose       -- GPR r15. 1=verbose (default), 0=quiet.
+                    Set by V (on) / v (off).
+
+  RAM size      -- GPR r20. Total detected RAM in bytes (hex).
+                    Set by bootstrap before IKARUS entry.
+                    Read-only, displayed by 'm'.
+                    Examples: 0x40000000 = 1 GB, 0x20000000 = 512 MB
+
+  Return addr   -- GPR r19. Saved caller LR. Used by g/x/q to return.
+
+
+========================================================================
+COMMAND REFERENCE
+========================================================================
+
+
+a -- Set Address
+------------------------------------------------------------------------
+Case:           a/A both work
+Immediate:      No, waits for hex input
+
+Prompts for a hex address.
+Input terminates on any non-hex character (Enter, space, etc.).
+The typed value REPLACES the current address entirely (starts from 0).
+
+The address is used by: r (read), w (write), + (advance), - (back),
+g (go/jump), and the 'z' upload protocol.
+
+Example:
+  >aFFF00100        -- sets address to 0xFFF00100
+
+NOTE: Only pure hex digits are accepted. No arithmetic, no +/- offsets,
+no expressions. Just raw hex. If you type nothing (just Enter), the
+address becomes 0.
+
+
+b -- Byte mode
+------------------------------------------------------------------------
+Case:           b/B both work
+Immediate:      Yes, single keypress
+
+Sets access size to byte (8-bit). Affects r, w, +, -, i, o display,
+and the space status output.
+
+After pressing 'b', reads/writes operate on single bytes, and +/-
+step by 1 byte.
+
+
+s -- Short mode (16-bit word)
+------------------------------------------------------------------------
+Case:           s/S both work
+Immediate:      Yes, single keypress
+
+Sets access size to short/word (16-bit). After this, reads/writes
+operate on 16-bit values, +/- step by 2 bytes.
+
+
+l -- Long mode (32-bit dword)
+------------------------------------------------------------------------
+Case:           l/L both work
+Immediate:      Yes, single keypress
+
+Sets access size to long/dword (32-bit). After this, reads/writes
+operate on 32-bit values, +/- step by 4 bytes.
+
+
+r -- Read memory
+------------------------------------------------------------------------
+Case:           r/R both work
+Immediate:      Yes, single keypress (no input needed)
+
+Reads memory at the current address (A register) using the current
+size mode. The read value is stored in the I register and displayed.
+Uses sync instruction after the read for ordering.
+
+Output format:
+  =XX;          (byte mode, 2 hex digits)
+  =XXXX;        (short mode, 4 hex digits)
+  =XXXXXXXX;    (long mode, 8 hex digits)
+
+In verbose mode, prints "\r\n" before the '=' sign.
+
+Example:
+  >aFFF00100    -- set address
+  >l            -- long mode
+  >r            -- read: prints =4C00012C;
+
+
+w -- Write to memory
+------------------------------------------------------------------------
+Case:           w/W both work
+Immediate:      No, waits for hex input
+
+Writes a value to memory at the current address (A register) using
+the current size mode. Prompts for hex input.
+
+IMPORTANT: The hex input starts with the CURRENT O register value.
+Each hex digit you type shifts the existing value left by 4 bits and
+inserts the new nibble at the bottom. If O is currently 0, typing
+"FF" gives 0xFF. If O is currently 0x12, typing "3" gives 0x123.
+
+To enter a clean new value, first use 'o' to set O to 0, or just
+type all digits of the full value you want.
+
+The entered value is stored in the O register AND written to memory.
+Uses eieio instruction after the write for ordering.
+
+Example:
+  >aFFF00200    -- set address
+  >b            -- byte mode
+  >wAB          -- writes 0xAB to address 0xFFF00200
+                   (O register is now 0xAB)
+
+
++ -- Step forward
+------------------------------------------------------------------------
+Case:           + only (no uppercase equivalent)
+Immediate:      Yes, single keypress
+
+Advances the address (A register) by the current step size:
+  byte mode:  +1
+  short mode: +2
+  long mode:  +4
+
+Example:
+  >aFFF00100    -- address = FFF00100
+  >l            -- long mode
+  >+            -- address becomes FFF00104
+  >r            -- reads from FFF00104
+
+
+- -- Step backward
+------------------------------------------------------------------------
+Case:           - only
+Immediate:      Yes, single keypress
+
+Decreases the address (A register) by the current step size:
+  byte mode:  -1
+  short mode: -2
+  long mode:  -4
+
+
+i -- Set I (input/data) register
+------------------------------------------------------------------------
+Case:           i/I both work
+Immediate:      No, waits for hex input
+
+Sets the I register (r16) to a new value via hex input. The I register
+holds the last-read value (updated by 'r') and is passed as r3 when
+using 'g' to jump.
+
+The hex input starts from the CURRENT I value (same shift-and-insert
+behavior as 'w'). Terminate with any non-hex character.
+
+The I register is also shown in the space status display and is passed
+to 'g' as the r3 parameter.
+
+
+o -- Set O (output/write) register
+------------------------------------------------------------------------
+Case:           o/O both work
+Immediate:      No, waits for hex input
+
+Sets the O register (r11) to a new value via hex input. The O register
+holds the write value (updated by 'w') and is passed as r4 when using
+'g' to jump.
+
+The hex input starts from the CURRENT O value. Terminate with any
+non-hex character.
+
+The O register is also shown in the space status display and is passed
+to 'g' as the r4 parameter.
+
+
+g -- Go (jump to address)
+------------------------------------------------------------------------
+Case:           g/G both work
+Immediate:      Yes, single keypress -- IMMEDIATELY JUMPS
+
+Exits IKARUS and jumps to the address in the A register (set by 'a').
+Before jumping, sets up:
+  r3 = I register (r16) -- can be used as function parameter
+  r4 = O register (r11) -- can be used as function parameter
+
+This is a direct jump (not a call). There is no return to IKARUS.
+The destination code must handle its own stack setup etc.
+
+Example:
+  >aFFF00100    -- set address to reset vector
+  >g            -- jumps to FFF00100 (effectively reboots)
+
+  >aFFF00200    -- set address to Machine Check exception vector
+  >g            -- prints "Unexpected Exception" / "SYSTEM HALTED."
+
+  The same happens for all other exception vectors (0x200 MCE, 0x300 DSI,
+  0x400 ISI, 0x500 External, 0x600 Alignment, 0x700 Program, etc.).
+  They all do the same thing:
+    li   r3, <vector number>
+    b    exception_dispatch
+  The vector number is loaded into r3, then they all branch to the same
+  exception_dispatch handler which prints the message and halts.
+
+  Only 0x100 (System Reset) is different -- it has real code:
+    isync
+    sync
+    b    boot_start
+  This branches to the bootstrap init, so jumping there reboots.
+
+  Calling the bootstrap's own serial write function (actual address
+  0xFFF053FC -- found in the Ghidra disassembly):
+
+  >i00000041    -- set I=0x41 ('A'), use 8 digits to flush old value
+  >aFFF053FC    -- set address to serial write function
+  >g            -- prints 'A' continuously (floods terminal with AAAA...)
+
+  The function takes its character from r3 (= I register, low byte).
+  It returns via blr, and since 'g' sets LR = A, it returns to itself,
+  creating an infinite loop of printing.
+
+
+x -- Exit (reboot via reset vector)
+------------------------------------------------------------------------
+Case:           x/X both work
+Immediate:      Yes, single keypress -- IMMEDIATELY REBOOTS
+
+Exits IKARUS by jumping to address 0xFFF00100, which is the PowerPC
+system reset exception vector. The bootstrap ROM is mapped here, so
+this effectively reboots the machine from the very beginning of the
+bootstrap.
+
+The r3 and r4 registers are NOT set to specific values (they keep
+whatever IKARUS had internally). This is a hard reboot.
+
+
+q -- Quit (return to caller)
+------------------------------------------------------------------------
+Case:           q/Q both work
+Immediate:      Yes, single keypress
+
+Exits IKARUS by returning to the bootstrap code that called it.
+After returning, the bootstrap calls FUN_fff84f58 and then enters
+fatal_hang (infinite loop). So 'q' does NOT resume booting -- it
+exits IKARUS and hangs.
+
+Difference from 'x': 'q' returns to caller then hangs.
+'x' reboots the entire machine via the reset vector.
+Use 'x' to restart the boot process, 'q' to just stop.
+
+
+c -- CPU (show PVR)
+------------------------------------------------------------------------
+Case:           c/C both work
+Immediate:      Yes, single keypress
+
+Reads the PowerPC Processor Version Register (PVR) using mfspr
+and displays it as an 8-digit hex value.
+
+Output format:  =XXXXXXXX;
+
+PVR format: upper 16 bits = processor type, lower 16 bits = revision.
+
+Examples (confirmed):
+  Real Pegasos II (G4):  =80020101;
+    0x8002 = MPC7457, 0x0101 = revision 1.1
+
+  QEMU Pegasos II:       =80020102;
+    0x8002 = MPC7457, 0x0102 = revision 1.2
+
+Common PowerPC G4 type codes:
+  0x8000 = MPC7441/7450      0x8001 = MPC7445/7455
+  0x8002 = MPC7447/7457      0x8003 = MPC7447A/7457A
+  0x8004 = MPC7448
+
+This is read-only -- it just displays the CPU type and revision.
+
+
+m -- Memory size (detected RAM)
+------------------------------------------------------------------------
+Case:           m/M both work
+Immediate:      Yes, single keypress
+
+Displays the value of internal register r20 -- the total detected RAM
+size in bytes. This value is computed by the bootstrap RAM bank detection
+routine (FUN_fff873ac at line 20118) which probes up to 4 memory banks
+and accumulates their sizes: `add r20, r20, r3` for each detected bank.
+
+Output format:  =XXXXXXXX;
+
+The value is the RAM size in bytes, displayed as hex:
+  1 GB RAM:   =40000000;   (0x40000000 = 1,073,741,824 bytes)
+  512 MB RAM: =20000000;   (0x20000000 = 536,870,912 bytes)
+  256 MB RAM: =10000000;   (0x10000000 = 268,435,456 bytes)
+Confirmed on both QEMU and real Pegasos II hardware.
+
+This is read-only. There is no command to change this value.
+
+
+V -- Verbose ON (uppercase V only)
+------------------------------------------------------------------------
+Immediate:      Yes, single keypress
+
+Turns verbose mode ON. When verbose:
+  - The prompt includes "\r\n" before '>' (each command on new line)
+  - Hex input echoes each typed digit back to the terminal
+  - Commands like r, space, m, c print "\r\n" before their output
+
+Verbose is ON by default when IKARUS starts.
+
+NOTE: Uppercase 'V' only! Lowercase 'v' does the opposite.
+
+
+v -- Verbose OFF (lowercase v only)
+------------------------------------------------------------------------
+Immediate:      Yes, single keypress
+
+Turns verbose mode OFF (quiet mode). When quiet:
+  - No "\r\n" before prompts or output
+  - Hex input does NOT echo typed digits
+  - Output is more compact (no newlines between commands)
+
+Useful for scripted/automated serial interaction where you don't
+want echo or extra newlines cluttering the protocol.
+
+NOTE: Lowercase 'v' only! Uppercase 'V' turns verbose ON.
+
+
+SPACE -- Show status
+------------------------------------------------------------------------
+Immediate:      Yes, single keypress
+
+Displays the current state of all IKARUS registers in one line:
+
+  =MAAAAAAAA,IVV,OVV;
+
+Where:
+  M = size mode letter: B (byte), S (short), L (long)
+  AAAAAAAA = current address (always 8 hex digits)
+  I + VV = I register value (formatted per current mode)
+  O + VV = O register value (formatted per current mode)
+
+The I and O values change width based on mode:
+  Byte mode:   =B00000000,I00,O00;
+  Short mode:  =S00000000,I0000,O0000;
+  Long mode:   =L00000000,I00000000,O00000000;
+
+On fresh IKARUS entry, default output is =B00000000,I00,O00;
+(all variables initialized to 0, mode defaults to byte).
+
+This is the most useful command for checking IKARUS state at a glance.
+
+
+~ -- Echo test (tilde)
+------------------------------------------------------------------------
+Immediate:      Yes, single keypress
+
+Simply echoes the '~' character back to the serial port. This is a
+connection test / loopback -- if you see '~' come back, the serial
+link is working in both directions.
+
+
+z -- Binary upload (serial receive protocol)
+------------------------------------------------------------------------
+Case:           z/Z both work
+Immediate:      No, waits for hex input
+
+THIS IS THE SERIAL UPLOAD PROTOCOL. It allows sending binary data
+from a host computer to the Pegasos II memory over the serial port.
+
+Protocol:
+  1. Press 'z' to enter upload mode
+  2. IKARUS waits for the '@' character (0x40) to start a block
+  3. IKARUS echoes '@' back to serial (must read and discard)
+  4. Send exactly 64 bytes of raw binary data (16 dwords, big-endian)
+  5. Send 1 checksum byte: low 8 bits of the sum of all 64 data bytes
+  6. IKARUS verifies the checksum:
+     - If OK: writes 64 bytes to memory at current address (A register),
+       advances address by 64 (0x40), sends ACK (byte 0x06)
+     - If BAD: sends NAK (byte 0x15), waits for next '@'
+  7. Repeat from step 2 for more blocks
+  8. To exit upload mode: send any character that is NOT '@'
+     IKARUS sends NAK (0x15) and returns to normal command prompt
+
+Block format per block:
+  Host sends:    '@' (1 byte) + DATA (64 bytes) + CHECKSUM (1 byte) = 66 bytes
+  IKARUS sends:  '@' echo (1 byte) + ACK or NAK (1 byte) = 2 bytes
+
+Checksum calculation:
+  checksum = sum(all 64 data bytes) & 0xFF
+
+The data bytes are written to memory in big-endian order, 4 bytes
+at a time (as 32-bit stores via stw). The address auto-advances by
+64 after each successful block. There is no block numbering or
+sequence tracking -- blocks are written linearly in order.
+
+To upload N bytes of data:
+  1. Set address with 'a' to the destination
+  2. Press 'z'
+  3. Send ceil(N/64) blocks of 64 bytes each (pad last block with zeros)
+  4. Send a non-'@' byte to exit
+  5. Press space to verify the address advanced correctly
+
+Example host-side pseudocode:
+  serial.write('z')
+  for each 64-byte chunk:
+      serial.write('@' + chunk + checksum)  # send 66 bytes as one packet
+      response = serial.read(2)             # read '@' echo + ACK/NAK
+      assert response[1] == 0x06            # ACK
+  serial.write('\n')  # exit upload mode
+
+Key details:
+  - The '@' echo MUST be read before (or together with) the ACK/NAK.
+    Sending '@'+data+checksum as one packet and reading 2 bytes back
+    is the most reliable approach (avoids timing issues).
+  - On NAK, IKARUS goes back to waiting for '@'. Retry the same block.
+  - At 115200 baud, uploading 1MB takes about 2 minutes.
+
+Ready-to-use upload script: ikarus_upload.py (in the same directory)
+
+  The script handles the full z protocol: sets long mode, sets the
+  destination address, enters upload mode, sends all blocks with
+  checksums and retries (up to 10 per block), then exits upload mode.
+
+  Requirements: Python 3, pyserial (pip install pyserial)
+
+  Arguments:
+    file            Binary file to upload (required)
+    --port PORT     Serial port (default: COM3)
+    --baud RATE     Baud rate (default: 115200)
+    --addr ADDR     Destination address in hex (default: 01000000)
+    --jump ADDR     After upload, set address to ADDR and send 'g' to
+                    jump. Shows serial output in terminal (Ctrl+C to quit).
+                    Without --jump, script exits after upload and you
+                    must use PuTTY to manually jump.
+
+  Usage (upload only):
+    1. Boot Pegasos II, press ESC in PuTTY to enter IKARUS
+    2. Close PuTTY (to release the COM port)
+    3. Run: python ikarus_upload.py smartfirmware.bin
+    4. Open PuTTY again
+    5. Type: >a01000100  >g   (jump to entry point, boot firmware)
+
+  Usage (upload + jump, no PuTTY needed after upload):
+    1. Boot Pegasos II, press ESC in PuTTY to enter IKARUS
+    2. Close PuTTY (to release the COM port)
+    3. Run: python ikarus_upload.py --addr 01000000 smartfirmware.bin --jump 01000100
+    The script uploads, then sets address to 0x01000100 and sends 'g'
+    to jump. Serial output is displayed in the terminal (Ctrl+C to quit).
+
+
+========================================================================
+PRACTICAL USAGE EXAMPLES
+========================================================================
+
+Reading memory (dump a few dwords):
+  >aFFF00100        set address to reset vector
+  >l                long mode
+  >r                read: =4C00012C;
+  >+                advance to FFF00104
+  >r                read: =7C0004AC;
+  >+                advance to FFF00108
+  >r                read: =48003EF8;
+
+Writing a byte:
+  >a00100000        set address
+  >b                byte mode
+  >w41              write 0x41 ('A') to 0x00100000
+  >r                verify: =41;
+
+Check current state:
+  (press space)     =B00100001,I41,O41;
+
+Upload binary data:
+  >a00200000        set destination address
+  >z                enter upload mode
+  (send blocks from host using '@'+64bytes+checksum protocol)
+  (send non-'@' byte to exit)
+  (press space)     verify address advanced
+
+Jump to uploaded code:
+  >a00200000        set address to uploaded code
+  >i00000001        set r3 parameter
+  >o00000000        set r4 parameter
+  >g                jump! (no return to IKARUS)
+
+Resume boot (decompress and run SmartFirmware):
+  >l
+  >aFFF045E0        set address to decompression setup
+  >r                verify: =480000A1;
+  >g                decompresses firmware to RAM, boots SmartFirmware
+
+  IKARUS runs BEFORE the firmware is decompressed. The gzipped
+  SmartFirmware is still in flash ROM (sub-blocks at 0xFFF20040+).
+  Address 0xFFF045E0 (found in Ghidra) is where the bootstrap sets up
+  the stack, computes the ROM base address, decompresses the firmware
+  to 0x01000000 in RAM, and jumps to 0x01000100. This allows you to
+  inspect or patch memory in IKARUS, then continue booting normally.
+
+Reboot:
+  >x                jumps to 0xFFF00100 (reset vector)
+
+Have fun !
